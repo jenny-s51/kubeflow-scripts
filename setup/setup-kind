@@ -13,6 +13,18 @@ notebooks_repo_url="https://github.com/kubeflow/notebooks"
 notebooks_registry_url="ghcr.io/kubeflow/notebooks"
 notebooks_manifests_ref="notebooks-v2"
 notebooks_commit_sha=""
+profile_namespace=""
+# Array to track temporary files for cleanup
+declare -a temp_files=()
+
+_cleanup_temp_files() {
+    local file
+    for file in "${temp_files[@]}"; do
+        if [ -n "$file" ] && [ -f "$file" ]; then
+            rm -f "$file"
+        fi
+    done
+}
 
 _usage() {
     cat <<EOF
@@ -453,6 +465,7 @@ _setup_notebooks_v1() {
 _setup_notebooks_v2() {
     local tmp_manifest_yaml
     tmp_manifest_yaml=$(mktemp)
+    temp_files+=("$tmp_manifest_yaml")
 
     local yq_filter='
         (. | select(.kind == "Deployment") | .spec.template.spec.containers // [])
@@ -507,11 +520,33 @@ _setup_notebooks_v2() {
 }
 
 _setup_sample_data() {
+  # Render profile manifest with kustomize
+  local tmp_manifest_yaml
+  tmp_manifest_yaml=$(mktemp)
+  temp_files+=("$tmp_manifest_yaml")
+  kustomize build "${kubeflow_repo_url}/common/user-namespace/base?ref=${kubeflow_manifests_ref}" > "${tmp_manifest_yaml}"
+
+  # Extract namespace name from the Profile resource in the rendered manifest using yq
+  # The namespace name is the same as the Profile name (metadata.name)
+  # Handle both List resources and separate YAML documents
+  # Try to find Profile in a List resource first
+  profile_namespace=$(yq eval '.items[] | select(.kind == "Profile") | .metadata.name' "${tmp_manifest_yaml}" 2>/dev/null | head -n1)
+  # If not found, search through individual YAML documents
+  if [ -z "$profile_namespace" ]; then
+    # Use yq to process all documents and find the Profile
+    profile_namespace=$(yq eval-all 'select(.kind == "Profile") | .metadata.name' "${tmp_manifest_yaml}" 2>/dev/null | head -n1)
+  fi
+
+  if [ -z "$profile_namespace" ]; then
+    echo "Error: Failed to extract namespace name from Profile resource in manifest" >&2
+    exit 1
+  fi
+
   # Install profile
-  kubectl apply -k "${kubeflow_repo_url}/common/user-namespace/base?ref=${kubeflow_manifests_ref}"
+  kubectl apply -f "${tmp_manifest_yaml}"
 
   # profile - wait for namespace to be active
-  _kubectl_wait "namespaces/kubeflow-user-example-com" \
+  _kubectl_wait "namespaces/${profile_namespace}" \
     --for=jsonpath='{.status.phase}'=Active \
     --timeout=180s
 }
@@ -645,6 +680,9 @@ EOF
 }
 
 _main() {
+    # Set up trap to clean up temp files on exit
+    trap _cleanup_temp_files EXIT
+
     _parse_args "$@"
 
     # Set kind command based on use_podman flag
